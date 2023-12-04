@@ -35,6 +35,8 @@ use crate::record::{
 };
 use crate::K_VALUE;
 use fnv::{FnvHashMap, FnvHashSet};
+use futures::Future;
+use futures_timer::Delay;
 use instant::Instant;
 use libp2p_core::{ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
@@ -51,6 +53,7 @@ use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::vec;
@@ -116,6 +119,8 @@ pub struct Behaviour<TStore> {
 
     /// The record storage.
     store: TStore,
+
+    bootstrap_status: BootstrapStatus,
 }
 
 /// The configurable strategies for the insertion of peers
@@ -181,6 +186,7 @@ pub struct Config {
     provider_publication_interval: Option<Duration>,
     kbucket_inserts: BucketInserts,
     caching: Caching,
+    bootstrap_interval: Option<Duration>,
 }
 
 impl Default for Config {
@@ -197,6 +203,7 @@ impl Default for Config {
             provider_record_ttl: Some(Duration::from_secs(24 * 60 * 60)),
             kbucket_inserts: BucketInserts::OnConnected,
             caching: Caching::Enabled { max_peers: 1 },
+            bootstrap_interval: Some(Duration::from_secs(5 * 60)),
         }
     }
 }
@@ -391,6 +398,14 @@ impl Config {
         self.caching = c;
         self
     }
+
+    /// Sets the interval on which [`Behaviour::bootstrap`] is called from [`Behaviour::poll`]
+    ///
+    /// `None` means we don't bootstrap at all.
+    pub fn set_bootstrap_interval(&mut self, interval: Option<Duration>) -> &mut Self {
+        self.bootstrap_interval = interval;
+        self
+    }
 }
 
 impl<TStore> Behaviour<TStore>
@@ -448,6 +463,7 @@ where
             mode: Mode::Client,
             auto_mode: true,
             no_events_waker: None,
+            bootstrap_status: BootstrapStatus::new(config.bootstrap_interval),
         }
     }
 
@@ -549,6 +565,7 @@ where
                 };
                 match entry.insert(addresses.clone(), status) {
                     kbucket::InsertResult::Inserted => {
+                        self.trigger_optional_bootstrap();
                         self.queued_events.push_back(ToSwarm::GenerateEvent(
                             Event::RoutingUpdated {
                                 peer: *peer,
@@ -867,7 +884,13 @@ where
     ///
     /// > **Note**: Bootstrapping requires at least one node of the DHT to be known.
     /// > See [`Behaviour::add_address`].
+    /// > **Note**: Bootstrap does not require to be called manually. It is automatically
+    /// invoked at regular intervals based on the configured bootstrapping interval.
+    /// The bootstrapping interval is used to call bootstrap periodically
+    /// to ensure a healthy routing table.
+    /// > See [`Config::set_bootstrap_interval`] for details.
     pub fn bootstrap(&mut self) -> Result<QueryId, NoKnownPeers> {
+        self.bootstrap_status.bootstrap_started();
         let local_key = self.kbuckets.local_key().clone();
         let info = QueryInfo::Bootstrap {
             peer: *local_key.preimage(),
@@ -1273,6 +1296,7 @@ where
                         let addresses = Addresses::new(a);
                         match entry.insert(addresses.clone(), new_status) {
                             kbucket::InsertResult::Inserted => {
+                                self.trigger_optional_bootstrap();
                                 let event = Event::RoutingUpdated {
                                     peer,
                                     is_new_peer: true,
@@ -1388,6 +1412,11 @@ where
                         .continue_iter_closest(query_id, target.clone(), peers, inner);
                 } else {
                     step.last = true;
+                    if result.stats.num_successes() > 0 {
+                        self.bootstrap_status.bootstrap_succeeded();
+                    } else {
+                        self.bootstrap_status.bootstrap_failed();
+                    }
                 };
 
                 Some(Event::OutboundQueryProgressed {
@@ -1590,6 +1619,11 @@ where
                         .continue_iter_closest(query_id, target.clone(), peers, inner);
                 } else {
                     step.last = true;
+                    if result.stats.num_successes() > 0 {
+                        self.bootstrap_status.bootstrap_succeeded();
+                    } else {
+                        self.bootstrap_status.bootstrap_failed();
+                    }
                 }
 
                 Some(Event::OutboundQueryProgressed {
@@ -2036,6 +2070,15 @@ where
         }
     }
 
+    fn trigger_optional_bootstrap(&mut self) {
+        if self.bootstrap_status.can_bootstrap() {
+            if let Err(err) = self.bootstrap() {
+                tracing::warn!("Failed to trigger bootstrap: {err}");
+                self.bootstrap_status.bootstrap_failed();
+            };
+        }
+    }
+
     /// Preloads a new [`Handler`] with requests that are waiting to be sent to the newly connected peer.
     fn preload_new_handler(
         &mut self,
@@ -2455,6 +2498,13 @@ where
                 }
             }
             self.put_record_job = Some(job);
+        }
+
+        if let Poll::Ready(()) = self.bootstrap_status.poll(cx) {
+            if let Err(err) = self.bootstrap() {
+                tracing::warn!("Failed to trigger bootstrap: {err}");
+                self.bootstrap_status.bootstrap_failed();
+            }
         }
 
         loop {
@@ -3337,4 +3387,81 @@ where
         .map(|addr| addr.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug)]
+enum BootstrapStatus {
+    DoBootstrapOnNewConnection(Option<Duration>),
+    InitialBootstrapRunning(Option<Duration>),
+    Periodic(Duration, Pin<Box<Delay>>),
+    Manual,
+}
+
+impl BootstrapStatus {
+    fn new(interval: Option<Duration>) -> Self {
+        match interval.is_some() {
+            true => Self::DoBootstrapOnNewConnection(interval),
+            false => Self::Manual,
+        }
+    }
+
+    fn can_bootstrap(&self) -> bool {
+        match self {
+            Self::DoBootstrapOnNewConnection(_) => true,
+            Self::InitialBootstrapRunning(_) | Self::Periodic(_, _) | Self::Manual => false,
+        }
+    }
+
+    fn bootstrap_succeeded(&mut self) {
+        match self {
+            Self::DoBootstrapOnNewConnection(interval)
+            | Self::InitialBootstrapRunning(interval) => {
+                *self = match *interval {
+                    Some(interval) => Self::Periodic(interval, Box::pin(Delay::new(interval))),
+                    None => Self::Manual,
+                };
+            }
+            Self::Periodic(_, _) => {
+                // bootstrap is already running periodicaly and everything is fine.
+            }
+            Self::Manual => {
+                // bootstrap was user triggered so the user should handle it.
+            }
+        }
+    }
+
+    fn bootstrap_failed(&mut self) {
+        match self {
+            Self::DoBootstrapOnNewConnection(_) => {}
+            Self::InitialBootstrapRunning(interval) => {
+                *self = Self::DoBootstrapOnNewConnection(*interval);
+            }
+            Self::Periodic(_, _) => {
+                // in future improvements, we could start an exponential backoff.
+            }
+            Self::Manual => {
+                // bootstrap was user triggered so the user should handle it.
+            }
+        }
+    }
+
+    fn bootstrap_started(&mut self) {
+        match self {
+            Self::DoBootstrapOnNewConnection(interval) => {
+                *self = Self::InitialBootstrapRunning(*interval);
+            }
+            Self::InitialBootstrapRunning(_) | Self::Periodic(_, _) | Self::Manual => {}
+        }
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Self::Periodic(interval, delay) = self {
+            if let Poll::Ready(()) = delay.as_mut().poll(cx) {
+                delay.reset(*interval);
+                return Poll::Ready(());
+            }
+        }
+
+        Poll::Pending
+    }
 }

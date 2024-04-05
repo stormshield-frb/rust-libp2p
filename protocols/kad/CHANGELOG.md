@@ -15,6 +15,8 @@
   See [PR 5122](https://github.com/libp2p/rust-libp2p/pull/5122).
 - Compute `jobs_query_capacity` accurately.
   See [PR 5148](https://github.com/libp2p/rust-libp2p/pull/5148).
+- Introduce `AsyncBehaviour`, a wrapper of `Behaviour` allowing to easily track Kademlia queries.
+  See [PR 5294](https://github.com/libp2p/rust-libp2p/pull/5294).
 
 ## 0.45.3
 

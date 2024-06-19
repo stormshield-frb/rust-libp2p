@@ -1392,7 +1392,12 @@ where
     /// table is currently small (less that `K_VALUE` peers are present) and only
     /// trigger a bootstrap in that case
     fn bootstrap_on_low_peers(&mut self) {
-        if self.kbuckets().count() < K_VALUE.get() {
+        if self
+            .kbuckets()
+            .map(|kbucket| kbucket.num_entries())
+            .sum::<usize>()
+            < K_VALUE.get()
+        {
             self.bootstrap_status.trigger();
         }
     }
